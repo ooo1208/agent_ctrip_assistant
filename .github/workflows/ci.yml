@@ -1,0 +1,38 @@
+name: Offline learning checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run business regression tests
+        run: python -m unittest discover -s . -p "test_*.py" -v
+      - name: Run complete offline scenario
+        run: python ctrip_agent.py --demo
+      - name: Run chapter exercises
+        run: |
+          for chapter in 01 02 03 04 05; do
+            python "examples/chapter-${chapter}.py"
+          done

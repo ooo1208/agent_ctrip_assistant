@@ -9,14 +9,15 @@
 克隆后进入本仓库目录，运行：
 
 ```bash
-python examples/chapter-05.py
+python ctrip_agent.py --demo
+python -m unittest discover -s . -p "test_*.py" -v
 ```
 
 无需安装依赖或配置密钥。示例创建临时 SQLite 库并清理；完整 CLI 的普通会话默认存于 `.data/ctrip.sqlite3`。金额统一采用人民币分。
 
 ## 当前内容与章节
 
-当前快照包含前 5 章。六个提交是在本次发布中，按依赖与学习顺序整理已有教学实现形成的真实提交；没有回填时间，也不代表六段原始开发周期。章序为本仓库学习安排，不能当作官方课程目录。
+当前快照包含前 6 章。六个提交是在本次发布中，按依赖与学习顺序整理已有教学实现形成的真实提交；没有回填时间，也不代表六段原始开发周期。章序为本仓库学习安排，不能当作官方课程目录。
 
 | 章 | 内容 | 文档 | Git 标签 |
 |---|---|---|---|
@@ -25,6 +26,7 @@ python examples/chapter-05.py
 | 03 | 审批事务、库存复核与幂等执行 | [章节说明](docs/chapter-03.md) | `chapter-03` |
 | 04 | 工具路由、参数边界与会话恢复 | [章节说明](docs/chapter-04.md) | `chapter-04` |
 | 05 | 完整命令行与可选模型工具协议 | [章节说明](docs/chapter-05.md) | `chapter-05` |
+| 06 | 回归测试、持续集成与完整学习入口 | [章节说明](docs/chapter-06.md) | `chapter-06` |
 
 在工作区干净时执行 `git switch --detach chapter-01` 可查看相应历史代码，执行 `git switch main` 回到完整版本。每章先运行对应的 `examples/chapter-XX.py`；只有最后一章包含完整回归测试和 CI。
 
@@ -57,3 +59,18 @@ python examples/chapter-05.py
 - [马士兵携程 AI 智能助手课程入口](https://www.mashibing.com/course/2801)：课程主题参考，不表示本仓库具有官方身份。
 
 本仓库原创代码与原创文档采用 [MIT License](LICENSE)。外部链接资料及第三方商标归各自权利人所有；本仓库没有重新许可或复制外部课件。
+
+## 完整版使用与验证
+
+[完整使用手册](docs/使用手册.md) 说明交互命令、恢复会话、模型环境变量和业务限制。
+
+```bash
+python ctrip_agent.py --user alice
+python ctrip_agent.py --user alice --session <此前打印的完整会话编号>
+```
+
+配置可选真实模型时，请参考 `.env.example`，程序不会自动读取 `.env`。密钥只放在自己的环境变量中，不进入 Git。
+
+本地 Python 3.11 已通过 13 项测试与完整离线演示。CI 同时配置 Python 3.11/3.12；远端执行结果以 Actions 状态为准。所有验证使用合成数据和临时数据库，模型相关测试采用明确标注的模拟协议对象，不消耗模型 Token。
+
+完整学习路线见 [Agent-Learning](https://github.com/ooo1208/Agent-Learning)，综合采购业务工程见 [ERP_OPENCLAW](https://github.com/ooo1208/ERP_OPENCLAW)。
