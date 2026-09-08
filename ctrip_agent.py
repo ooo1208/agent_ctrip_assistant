@@ -139,18 +139,15 @@ class Tools:
         store.own_session(user, session_id)
         self.store, self.user, self.session_id = store, user, session_id
 
-
     def search_flights(self, origin, destination, travel_date):
         valid_date(travel_date)
         return [dict(row) for row in self.store.db.execute(
             "SELECT * FROM flights WHERE origin=? AND destination=? AND travel_date=? ORDER BY price_cents",
             (valid_text(origin, "出发地"), valid_text(destination, "目的地"), travel_date))]
 
-
     def search_hotels(self, city):
         return [dict(row) for row in self.store.db.execute("SELECT * FROM hotels WHERE city=? ORDER BY nightly_cents",
                                                           (valid_text(city, "城市"),))]
-
 
     def propose(self, kind, payload):
         action_id = identifier()
@@ -161,7 +158,6 @@ class Tools:
         return {"action_id": action_id, "status": "pending", "payload": payload,
                 "notice": f"尚未下单。核对详情后在终端输入：审批 {action_id}；或：拒绝 {action_id}"}
 
-
     def propose_book_flight(self, flight_id, passenger):
         row = self.store.db.execute("SELECT * FROM flights WHERE id=?", (valid_text(flight_id, "flight_id"),)).fetchone()
         if not row or row["seats"] <= 0:
@@ -171,7 +167,6 @@ class Tools:
         return self.propose("flight", {"flight_id": row["id"], "passenger": valid_text(passenger, "乘机人"),
             "origin": row["origin"], "destination": row["destination"], "travel_date": row["travel_date"],
             "total_cents": row["price_cents"]})
-
 
     def propose_book_hotel(self, hotel_id, checkin, checkout, guest):
         first, last = valid_date(checkin), valid_date(checkout)
@@ -186,7 +181,6 @@ class Tools:
             "guest": valid_text(guest, "入住人"), "checkin": first.isoformat(), "checkout": last.isoformat(),
             "nightly_cents": row["nightly_cents"], "total_cents": row["nightly_cents"] * (last-first).days})
 
-
     def hotel_available(self, hotel, first, last):
         day = first
         while day < last:
@@ -198,12 +192,63 @@ class Tools:
             day += dt.timedelta(days=1)
         return True
 
-
     def list_orders(self):
         return [{**dict(row), "details": json.loads(row["details"])} for row in self.store.db.execute(
             "SELECT * FROM orders WHERE user_id=? ORDER BY rowid", (self.user,))]
 
-
     def list_pending_actions(self):
         return self.store.pending(self.user, self.session_id)
 
+    def decide(self, action_id, approve):
+        """只能由终端显式审批入口调用；在同一写事务中校验、扣减、下单。"""
+        with self.store.transaction():
+            row = self.store.db.execute(
+                "SELECT * FROM actions WHERE id=? AND user_id=? AND session_id=?",
+                (action_id, self.user, self.session_id)).fetchone()
+            if not row:
+                raise ValueError("动作不存在或不属于当前用户/会话")
+            if row["status"] == "approved" and approve:
+                order = self.store.db.execute("SELECT id FROM orders WHERE action_id=?", (action_id,)).fetchone()
+                return {"status": "approved", "order_id": order[0], "reused": True}
+            if row["status"] != "pending":
+                raise ValueError(f"动作已处于 {row['status']} 状态，不能再次处理")
+            if not approve:
+                self.store.db.execute("UPDATE actions SET status='rejected' WHERE id=?", (action_id,))
+                return {"status": "rejected", "action_id": action_id, "notice": "已拒绝，未创建订单"}
+            if now() >= dt.datetime.fromisoformat(row["expires_at"]):
+                self.store.db.execute("UPDATE actions SET status='expired' WHERE id=?", (action_id,))
+                return {"status": "expired", "notice": "审批已过期，请重新查询并创建待审批动作"}
+            payload = json.loads(row["payload"])
+            reason = self.recheck(row["kind"], payload)
+            if reason:
+                self.store.db.execute("UPDATE actions SET status='stale' WHERE id=?", (action_id,))
+                return {"status": "stale", "notice": reason + "；未下单，请重新查询并确认"}
+            order_id = identifier()
+            resource_id = payload["flight_id"] if row["kind"] == "flight" else payload["hotel_id"]
+            if row["kind"] == "flight":
+                self.store.db.execute("UPDATE flights SET seats=seats-1 WHERE id=?", (resource_id,))
+            self.store.db.execute("INSERT INTO orders VALUES(?,?,?,?,?,?,?,?,?,?)", (
+                order_id, action_id, self.session_id, self.user, row["kind"], resource_id,
+                payload.get("checkin"), payload.get("checkout"), payload["total_cents"], dump(payload)))
+            self.store.db.execute("UPDATE actions SET status='approved' WHERE id=?", (action_id,))
+            return {"status": "approved", "order_id": order_id, "details": payload, "notice": "模拟订单已创建"}
+
+    def recheck(self, kind, payload):
+        if kind == "flight":
+            row = self.store.db.execute("SELECT * FROM flights WHERE id=?", (payload["flight_id"],)).fetchone()
+            if not row or row["seats"] < 1:
+                return "航班已售罄或被移除"
+            if any(row[key] != payload[key] for key in ("origin", "destination", "travel_date")):
+                return "航班行程已变化"
+            if row["price_cents"] != payload["total_cents"]:
+                return "机票价格已变化"
+            if valid_date(row["travel_date"]) < dt.date.today():
+                return "航班日期已过期"
+        else:
+            row = self.store.db.execute("SELECT * FROM hotels WHERE id=?", (payload["hotel_id"],)).fetchone()
+            if not row or row["name"] != payload["name"] or row["nightly_cents"] != payload["nightly_cents"]:
+                return "酒店或房价已变化"
+            first, last = valid_date(payload["checkin"]), valid_date(payload["checkout"])
+            if first < dt.date.today() or not self.hotel_available(row, first, last):
+                return "入住日期已过期或房间已售罄"
+        return None
