@@ -131,3 +131,79 @@ class Store:
         result = dict(row)
         result["payload"] = json.loads(result["payload"])
         return result
+
+
+class Tools:
+    """工具执行端绑定用户与会话，模型参数不能覆盖身份或审批动作。"""
+    def __init__(self, store, user, session_id):
+        store.own_session(user, session_id)
+        self.store, self.user, self.session_id = store, user, session_id
+
+
+    def search_flights(self, origin, destination, travel_date):
+        valid_date(travel_date)
+        return [dict(row) for row in self.store.db.execute(
+            "SELECT * FROM flights WHERE origin=? AND destination=? AND travel_date=? ORDER BY price_cents",
+            (valid_text(origin, "出发地"), valid_text(destination, "目的地"), travel_date))]
+
+
+    def search_hotels(self, city):
+        return [dict(row) for row in self.store.db.execute("SELECT * FROM hotels WHERE city=? ORDER BY nightly_cents",
+                                                          (valid_text(city, "城市"),))]
+
+
+    def propose(self, kind, payload):
+        action_id = identifier()
+        created = now()
+        self.store.db.execute("INSERT INTO actions VALUES(?,?,?,?,?,?,?,?)", (
+            action_id, self.session_id, self.user, kind, dump(payload), "pending",
+            created.isoformat(), (created + dt.timedelta(minutes=15)).isoformat()))
+        return {"action_id": action_id, "status": "pending", "payload": payload,
+                "notice": f"尚未下单。核对详情后在终端输入：审批 {action_id}；或：拒绝 {action_id}"}
+
+
+    def propose_book_flight(self, flight_id, passenger):
+        row = self.store.db.execute("SELECT * FROM flights WHERE id=?", (valid_text(flight_id, "flight_id"),)).fetchone()
+        if not row or row["seats"] <= 0:
+            raise ValueError("航班不存在或已售罄")
+        if valid_date(row["travel_date"]) < dt.date.today():
+            raise ValueError("航班日期已过期")
+        return self.propose("flight", {"flight_id": row["id"], "passenger": valid_text(passenger, "乘机人"),
+            "origin": row["origin"], "destination": row["destination"], "travel_date": row["travel_date"],
+            "total_cents": row["price_cents"]})
+
+
+    def propose_book_hotel(self, hotel_id, checkin, checkout, guest):
+        first, last = valid_date(checkin), valid_date(checkout)
+        if first < dt.date.today() or not 1 <= (last - first).days <= 14:
+            raise ValueError("入住须为今天及以后，连续入住 1–14 晚")
+        row = self.store.db.execute("SELECT * FROM hotels WHERE id=?", (valid_text(hotel_id, "hotel_id"),)).fetchone()
+        if not row:
+            raise ValueError("酒店不存在")
+        if not self.hotel_available(row, first, last):
+            raise ValueError("所选日期存在满房，请更换日期或酒店")
+        return self.propose("hotel", {"hotel_id": row["id"], "name": row["name"],
+            "guest": valid_text(guest, "入住人"), "checkin": first.isoformat(), "checkout": last.isoformat(),
+            "nightly_cents": row["nightly_cents"], "total_cents": row["nightly_cents"] * (last-first).days})
+
+
+    def hotel_available(self, hotel, first, last):
+        day = first
+        while day < last:
+            occupied = self.store.db.execute(
+                "SELECT COUNT(*) FROM orders WHERE kind='hotel' AND resource_id=? AND checkin<=? AND checkout>?",
+                (hotel["id"], day.isoformat(), day.isoformat())).fetchone()[0]
+            if occupied >= hotel["rooms"]:
+                return False
+            day += dt.timedelta(days=1)
+        return True
+
+
+    def list_orders(self):
+        return [{**dict(row), "details": json.loads(row["details"])} for row in self.store.db.execute(
+            "SELECT * FROM orders WHERE user_id=? ORDER BY rowid", (self.user,))]
+
+
+    def list_pending_actions(self):
+        return self.store.pending(self.user, self.session_id)
+
