@@ -252,3 +252,76 @@ class Tools:
             if first < dt.date.today() or not self.hotel_available(row, first, last):
                 return "入住日期已过期或房间已售罄"
         return None
+
+
+TOOL_PARAMETERS = {
+    "search_flights": ("按出发地、目的地、日期查询模拟航班", ["origin", "destination", "travel_date"]),
+    "search_hotels": ("按城市查询模拟酒店，房量还需在提案及审批时校验", ["city"]),
+    "propose_book_flight": ("提交机票待审批动作；不会下单", ["flight_id", "passenger"]),
+    "propose_book_hotel": ("提交酒店待审批动作；不会下单", ["hotel_id", "checkin", "checkout", "guest"]),
+    "list_orders": ("查看当前用户已创建的模拟订单", []),
+    "list_pending_actions": ("查看当前会话待审批动作及完整参数", []),
+}
+
+
+class Router:
+    def __init__(self, tools):
+        self.tools = tools
+
+    def execute(self, name, arguments):
+        if name not in TOOL_PARAMETERS or not isinstance(arguments, dict):
+            raise ValueError("未知工具或参数不是对象")
+        expected = TOOL_PARAMETERS[name][1]
+        if set(arguments) != set(expected) or any(not isinstance(value, str) for value in arguments.values()):
+            raise ValueError(f"工具 {name} 必须且只能提供文本字段：{expected}")
+        workflow = "flight" if "flight" in name else "hotel" if "hotel" in name else "primary"
+        self.tools.store.db.execute("UPDATE sessions SET workflow=? WHERE id=? AND user_id=?",
+                                   (workflow, self.tools.session_id, self.tools.user))
+        result = getattr(self.tools, name)(**arguments)
+        return {"route": f"primary → {workflow}", "tool": name, "result": result}
+
+
+HELP = """离线命令（固定语法，不会调用模型）：
+  查航班 上海 北京 YYYY-MM-DD
+  订机票 MU5101 张三
+  查酒店 北京
+  订酒店 BJ01 YYYY-MM-DD YYYY-MM-DD 张三
+  待审批 / 订单
+  审批 <完整 action_id> / 拒绝 <完整 action_id>
+  帮助 / 退出
+模型模式可自由表达查询和预订需求，审批仍必须使用上面的终端命令。
+金额字段统一为人民币分；模型只操作本地模拟业务数据。
+"""
+
+
+def offline(router, text):
+    parts = shlex.split(text)
+    mappings = {"查航班": "search_flights", "订机票": "propose_book_flight", "查酒店": "search_hotels",
+                "订酒店": "propose_book_hotel", "订单": "list_orders", "待审批": "list_pending_actions"}
+    if not parts or parts[0] not in mappings:
+        raise ValueError("未识别命令，请输入 帮助；离线模式使用固定命令，不进行自然语言理解")
+    name = mappings[parts[0]]
+    fields = TOOL_PARAMETERS[name][1]
+    if len(parts[1:]) != len(fields):
+        raise ValueError(f"参数不完整，需要：{' '.join(fields)}")
+    return router.execute(name, dict(zip(fields, parts[1:])))
+
+
+def handle(router, text):
+    tools = router.tools
+    tools.store.append_messages(tools.user, tools.session_id, [{"role": "user", "content": text}])
+    try:
+        command = text.split(maxsplit=1)[0] if text.strip() else ""
+        if command in ("审批", "拒绝"):
+            parts = shlex.split(text)
+            if len(parts) != 2:
+                raise ValueError("请提供一个完整 action_id")
+            result = tools.decide(parts[1], approve=parts[0] == "审批")
+        else:
+            result = offline(router, text)
+        output = dump(result)
+    except (ValueError, RuntimeError) as exc:
+        output = dump({"error": str(exc), "notice": "请通过 订单 / 待审批 查看持久化状态"})
+    tools.store.append_messages(tools.user, tools.session_id, [{"role": "assistant", "content": output}])
+    return output
+
