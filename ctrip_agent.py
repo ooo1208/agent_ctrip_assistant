@@ -307,7 +307,76 @@ def offline(router, text):
     return router.execute(name, dict(zip(fields, parts[1:])))
 
 
-def handle(router, text):
+class ModelClient:
+    def __init__(self):
+        self.base = os.environ.get("MODEL_BASE_URL", "").rstrip("/")
+        self.key = os.environ.get("MODEL_API_KEY", "")
+        self.model = os.environ.get("MODEL_NAME", "")
+        if not self.base or not self.key or not self.model:
+            raise ValueError("模型模式需设置 MODEL_BASE_URL、MODEL_API_KEY、MODEL_NAME；不会自动回退离线")
+        if not self.base.startswith(("https://", "http://localhost:", "http://127.0.0.1:")):
+            raise ValueError("远程模型地址必须使用 HTTPS；本地开发端口允许 HTTP")
+
+    def complete(self, messages):
+        specs = [{"type": "function", "function": {"name": name, "description": description,
+                  "parameters": {"type": "object", "properties": {key: {"type": "string"} for key in fields},
+                                 "required": fields, "additionalProperties": False}}}
+                 for name, (description, fields) in TOOL_PARAMETERS.items()]
+        body = dump({"model": self.model, "messages": messages, "tools": specs, "tool_choice": "auto"}).encode("utf-8")
+        request = urllib.request.Request(self.base + "/chat/completions", data=body, headers={
+            "Content-Type": "application/json", "Authorization": "Bearer " + self.key})
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                result = json.load(response)
+            raw = result["choices"][0]["message"]
+            if not isinstance(raw, dict):
+                raise ValueError("message 不是对象")
+            message = {"role": "assistant", "content": raw.get("content")}
+            if raw.get("tool_calls"):
+                message["tool_calls"] = raw["tool_calls"]
+            return message
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"模型接口返回 HTTP {exc.code}；本次未获得完整模型结果") from None
+        except (urllib.error.URLError, TimeoutError, OSError):
+            raise RuntimeError("模型连接失败或超时；未自动降级，请检查服务配置") from None
+        except (ValueError, KeyError, IndexError, TypeError):
+            raise RuntimeError("模型接口响应格式不符合 Chat Completions 协议") from None
+
+
+def model_turn(client, router):
+    tools = router.tools
+    system = {"role": "system", "content": (
+        "你是教学旅行客服主助手，按工具结果回答，金额是人民币分。flight/hotel 为专业业务流程。"
+        "可以查询和提出预订动作，但不能替用户审批。pending 只是待审批，绝不能说订单已创建。"
+        "只在工具返回 approved 或订单查询有真实记录时确认成功。缺少参数必须询问。"
+        "不得虚构库存、日期、价格、身份或动作编号。工具错误应如实说明。"
+        "请显示完整 action_id 和价格、行程，用户通过终端 审批 <action_id> 或 拒绝 <action_id> 处理。")}
+    for _ in range(6):
+        message = client.complete([system] + tools.store.history(tools.user, tools.session_id))
+        calls = message.get("tool_calls", [])
+        if not calls:
+            if not isinstance(message.get("content"), str) or not message["content"].strip():
+                raise RuntimeError("模型未给出文本或工具调用，本次未完成")
+            tools.store.append_messages(tools.user, tools.session_id, [message])
+            return message["content"]
+        if not isinstance(calls, list) or len(calls) > 8:
+            raise RuntimeError("模型工具调用格式或数量异常，本轮未执行")
+        ids = [call.get("id") for call in calls if isinstance(call, dict)]
+        if len(ids) != len(calls) or any(not isinstance(i, str) or not i for i in ids) or len(set(ids)) != len(ids):
+            raise RuntimeError("模型工具调用 ID 异常，本轮未执行")
+        responses = []
+        for call in calls:
+            try:
+                function = call["function"]
+                result = router.execute(function["name"], json.loads(function["arguments"]))
+            except (ValueError, KeyError, TypeError) as exc:
+                result = {"error": str(exc)}
+            responses.append({"role": "tool", "tool_call_id": call["id"], "content": dump(result)})
+        tools.store.append_messages(tools.user, tools.session_id, [message] + responses)
+    raise RuntimeError("已达到 6 轮工具调用上限；请查看 待审批，已有提案仍未下单")
+
+
+def handle(router, text, client=None):
     tools = router.tools
     tools.store.append_messages(tools.user, tools.session_id, [{"role": "user", "content": text}])
     try:
@@ -317,11 +386,87 @@ def handle(router, text):
             if len(parts) != 2:
                 raise ValueError("请提供一个完整 action_id")
             result = tools.decide(parts[1], approve=parts[0] == "审批")
-        else:
+        elif text in ("待审批", "订单") or client is None:
             result = offline(router, text)
+        else:
+            return model_turn(client, router)
         output = dump(result)
     except (ValueError, RuntimeError) as exc:
         output = dump({"error": str(exc), "notice": "请通过 订单 / 待审批 查看持久化状态"})
     tools.store.append_messages(tools.user, tools.session_id, [{"role": "assistant", "content": output}])
     return output
 
+
+def demo(path):
+    store = Store(path)
+    user, session = "demo-alice", store.session("demo-alice")
+    router = Router(Tools(store, user, session))
+    travel_date = store.db.execute("SELECT travel_date FROM flights WHERE id='MU5101'").fetchone()[0]
+    checkout = (valid_date(travel_date) + dt.timedelta(days=2)).isoformat()
+    print("离线合成数据固定场景：查询 → 机票审批 → 酒店拒绝 → 关闭数据库 → 恢复会话。")
+    print(f"session_id={session} / fixture_date={travel_date}")
+    commands = [f"查航班 上海 北京 {travel_date}", "订机票 MU5101 张三"]
+    for command in commands:
+        print(f"> {command}\n{handle(router, command)}")
+    flight_action = store.pending(user, session)[-1]["id"]
+    print(handle(router, "审批 " + flight_action))
+    print(handle(router, f"订酒店 BJ01 {travel_date} {checkout} 张三"))
+    hotel_action = store.pending(user, session)[-1]["id"]
+    store.close()
+    store = Store(path)
+    router = Router(Tools(store, user, store.session(user, session)))
+    print("数据库重新打开，使用同一个 user/session 恢复待审批酒店：")
+    print(handle(router, "待审批"))
+    print(handle(router, "拒绝 " + hotel_action))
+    print(handle(router, "订单"))
+    assert len(router.tools.list_orders()) == 1, "演示应当只创建获批的机票订单"
+    store.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="客服 Agent 原创教学实现：可恢复会话与持久化审批")
+    parser.add_argument("--demo", action="store_true", help="运行独立临时数据库离线演示")
+    parser.add_argument("--db", default=None)
+    parser.add_argument("--user", default="alice")
+    parser.add_argument("--session", default=None, help="恢复属于当前 user 的既有会话")
+    parser.add_argument("--mode", choices=("offline", "llm"), default="offline")
+    args = parser.parse_args()
+    if args.demo:
+        with tempfile.TemporaryDirectory(prefix="ctrip-demo-") as directory:
+            demo(str(Path(directory) / "demo.sqlite3"))
+        return
+    client = ModelClient() if args.mode == "llm" else None
+    store = Store(args.db or str(Path(__file__).parent / ".data" / "ctrip.sqlite3"))
+    try:
+        session = store.session(args.user, args.session)
+        router = Router(Tools(store, args.user, session))
+        date = store.db.execute("SELECT travel_date FROM flights WHERE id='MU5101'").fetchone()[0]
+        print(f"mode={args.mode} / data=synthetic / user={args.user} / session_id={session}")
+        print(f"数据库已有示例航班日期：{date}。退出后用 --user {args.user} --session {session} 恢复。")
+        print(HELP)
+        while True:
+            try:
+                text = input("> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n会话已保存")
+                break
+            if text == "退出":
+                break
+            if text == "帮助":
+                print(HELP)
+            elif text:
+                print(handle(router, text, client))
+    finally:
+        store.close()
+
+
+if __name__ == "__main__":
+    # 保证 Windows 管道/统一学习入口捕获到 UTF-8 中文输出。
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
+    try:
+        main()
+    except (ValueError, RuntimeError) as exc:
+        raise SystemExit(str(exc)) from None
